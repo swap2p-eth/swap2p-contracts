@@ -75,6 +75,7 @@ contract Swap2p {
     error SelfPartnerNotAllowed();
     error NotFiatPayer();
     error Reentrancy();
+    error WorsePrice();
 
     /*────────────── EVENTS (без изменений) ─────────*/
 
@@ -168,8 +169,8 @@ contract Swap2p {
     /// «Мягкое» удаление: офер обнуляется, ключ выходит из массива только когда нет открытых сделок
     function maker_deleteOffer(Side s,FiatCode f) external{
         delete offers[msg.sender][s][f];
-        if(_openDeals[msg.sender].length==0){ _removeOfferKey(msg.sender,s,f); }
-        emit OfferDeleted(msg.sender,s,f);
+        _removeOfferKey(msg.sender, s, f);
+        emit OfferDeleted(msg.sender, s, f);
     }
 
     /*────────────── SELECT (TAKER) ────────────────*/
@@ -177,8 +178,14 @@ contract Swap2p {
         Side s,address maker,uint128 amount,FiatCode f,
         string calldata details,address partner
     ) external payable{
-        Offer storage off=offers[maker][s][f];
-        if(off.maxAmt==0) revert OfferNotFound();
+        Offer storage off = offers[maker][side][fiat];
+        if (off.maxAmt == 0) revert OfferNotFound();
+        if (side == Side.BUY) {
+            if (off.priceFiatPerToken < expectedPrice) revert WorsePrice();
+        } else { // SELL
+            if (off.priceFiatPerToken > expectedPrice) revert WorsePrice();
+        }
+        if (amount < off.minAmt || amount > off.maxAmt) revert AmountOutOfBounds();
         if(amount<off.minAmt||amount>off.maxAmt) revert AmountOutOfBounds();
 
         uint128 need=s==Side.BUY?amount*2:amount;
