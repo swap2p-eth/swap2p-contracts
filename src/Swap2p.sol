@@ -2,7 +2,7 @@
 pragma solidity ^0.8.23;
 
 /*╔════════════════════════════════════════════════════╗*\
-║   Swap2p – non-custodial native-to-fiat P2P market  ║
+|*║   Swap2p – non-custodial native-to-fiat P2P market ║*|
 \*╚════════════════════════════════════════════════════╝*/
 
 contract Swap2p {
@@ -18,7 +18,7 @@ contract Swap2p {
     struct Offer {
         uint128 minAmt;
         uint128 maxAmt;
-        uint96  reserveFiat;
+        uint96  reserve;
         uint96  priceFiatPerToken;
         FiatCode fiat;
         uint32  ts;
@@ -154,19 +154,18 @@ contract Swap2p {
 
     /*────────────── OFFER MANAGEMENT ──────────────*/
     function maker_makeOffer(
-        Side s, FiatCode f, uint96 price, uint96 reserveFiat,
+        Side s, FiatCode f, uint96 price, uint96 reserve,
         uint128 minAmt,uint128 maxAmt,
         string calldata pay,string calldata comment
     ) external{
         _addOfferKey(msg.sender,s,f);
         offers[msg.sender][s][f]=Offer({
-            minAmt:minAmt,maxAmt:maxAmt,reserveFiat:reserveFiat,
+            minAmt:minAmt,maxAmt:maxAmt,reserve:reserve,
             priceFiatPerToken:price,fiat:f,ts:uint32(block.timestamp),side:s
         });
         emit OfferUpsert(msg.sender,s,f,offers[msg.sender][s][f],pay,comment);
     }
 
-    /// «Мягкое» удаление: офер обнуляется, ключ выходит из массива только когда нет открытых сделок
     function maker_deleteOffer(Side s,FiatCode f) external{
         delete offers[msg.sender][s][f];
         _removeOfferKey(msg.sender, s, f);
@@ -194,11 +193,6 @@ contract Swap2p {
         }
 
         if (amount < off.minAmt || amount > off.maxAmt) revert AmountOutOfBounds();
-
-        /* —── резерв в фиате —── */
-        uint128 fiatDeal = _calcFiat(amount, off.priceFiatPerToken);
-        require(off.reserveFiat >= fiatDeal, "ReserveTooLow");
-        off.reserveFiat -= fiatDeal;                          // списываем
 
         uint128 need = s == Side.BUY ? amount * 2 : amount;
         if (msg.value != need) revert InsufficientDeposit();
