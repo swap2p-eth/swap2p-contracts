@@ -1,6 +1,41 @@
 [profile.default]
-src = "src"
-out = "out"
-libs = ["lib"]
+src              = "src"
+out              = "out"
+libs             = ["lib"]
 
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+# — Solidity compiler —
+solc_version     = "0.8.23"
+evm_version      = "paris"          # merge / EOF-1 ready
+optimizer        = true
+optimizer_runs   = 100_000          # high-runs for on-chain code
+via_ir           = true             # tighter bytecode
+
+# — Bytecode metadata —
+bytecode_hash    = "none"           # deterministic output
+
+# — Testing defaults —
+gas_reports      = ["Swap2p"]       # show gas table for main contract
+fuzz_runs        = 1_000            # per-test fuzz iterations
+verbosity        = 3                # show reverts reason in logs
+
+# — Tooling integration —
+ffi              = false            # set true if calling scripts in tests
+evm_storage_caching = 50_000        # speed up large state fuzz
+
+# — remappings (example OZ) —
+remappings = [
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+    "@forge-std/=lib/forge-std/src/"
+]
+
+# Lightweight build / CI pass-fast
+[profile.ci]
+optimizer_runs = 500
+via_ir         = false
+fuzz_runs      = 200
+
+# Debugging (no optimization, rich revert strings)
+[profile.debug]
+optimizer      = false
+via_ir         = false
+verbosity      = 4
