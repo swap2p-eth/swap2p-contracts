@@ -1,101 +1,337 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.23;
 
-/// @dev Contract for non custodial P2P buy and sell native token for fiat currency
-/// @dev Deals protected by dual-sided deposit escrow scheme (mutual escrow)
-/// @dev So both sides interested to close the deal ASAP and return collaterals back
-/// @dev Side BUY - buy crypto, SELL - Sell crypto (for fiat)
 contract Swap2p {
+    /*──────────────────────────────────────────────────────*/
+    /*  CONSTANTS & TYPES                                   */
+    /*──────────────────────────────────────────────────────*/
 
-    // TODO events for all state-changing functions
+    uint32 public constant FEE_BPS      = 10;     // 0.10 %
+    uint32 public constant AFF_SHARE_BP = 2000;   // 20 %  (из комиссии)
 
-    // TODO custom errors
+    type FiatCode is uint24;                      // "USD" → 0x555344
 
-    address private immutable author;
-    mapping (address => address) public partners; // TODO
+    enum DealState { NONE, SELECTED, ACCEPTED, PAID, RELEASED, CANCELED }
 
-    constructor() {
+    struct Offer {
+        uint128 minAmt;
+        uint128 maxAmt;
+        uint96  reserveFiat;
+        uint96  price;          // fiat per 1e18 native
+        FiatCode fiat;
+        uint32  ts;
+        bool    online;         // maker status snapshot
+    }
+
+    struct Deal {
+        uint128 amount;         // escrow сумма сделки
+        uint96  price;
+        DealState state;
+        address maker;
+        address taker;
+        FiatCode fiat;
+        uint40  tsSelect;
+        uint40  tsLast;
+    }
+
+    struct MakerProfile {
+        bool   online;          // 1 байт
+        uint8  startHour;       // UTC 0-23
+        uint8  endHour;         // UTC 0-23
+    }
+
+    /*──────────────────────────────────────────────────────*/
+    /*  STORAGE                                             */
+    /*──────────────────────────────────────────────────────*/
+
+    address public immutable author;              // получает комиссию
+    uint96  private  _dealSeq;                    // уникальные id
+
+    mapping(address => mapping(FiatCode => Offer)) public offers;      // maker ⇒ fiat ⇒ offer
+    mapping(uint96  => Deal)                      public deals;        // id    ⇒ deal
+    mapping(address => uint128)                  public pendingWithdraw; // fallback-кредиты
+
+    mapping(address => address)                  public affiliates;    // taker ⇒ партнёр
+    mapping(address => MakerProfile)             public makerProfile;  // статус + часы
+
+    /*──────────────────────────────────────────────────────*/
+    /*  EVENTS                                              */
+    /*──────────────────────────────────────────────────────*/
+
+    event OfferUpsert(address indexed maker, FiatCode fiat, Offer offer, string payMethods, string comment);
+    event OfferDeleted(address indexed maker, FiatCode fiat);
+    event DealSelected(uint96 indexed id, address indexed maker, address indexed taker, uint128 amount, string paymentDetails);
+    event DealCanceled(uint96 indexed id, string reason);
+    event DealAccepted(uint96 indexed id, string msgFromMaker);
+    event DealPaid(uint96 indexed id, string msgFromMaker);
+    event DealReleased(uint96 indexed id);
+    event Message(uint96 indexed id, address indexed from, string text);
+
+    event Payout(address indexed to, uint128 amount);                 // off-chain учёт
+    event PendingCredit(address indexed to, uint128 amount);          // когда push не прошёл
+    event Withdraw(address indexed to, uint128 amount);
+    event PartnerBound(address indexed taker, address indexed partner);
+
+    event MakerOnline(address indexed maker, bool online);
+    event WorkingHoursSet(address indexed maker, uint8 startHour, uint8 endHour);
+
+    /*──────────────────────────────────────────────────────*/
+    /*  CONSTRUCTOR                                         */
+    /*──────────────────────────────────────────────────────*/
+
+    constructor() payable {
         author = msg.sender;
     }
 
-    // TODO? go online / offline functions for MM
-    // TODO? working hours for MM
+    /*──────────────────────────────────────────────────────*/
+    /*  MODIFIERS & INTERNALS                               */
+    /*──────────────────────────────────────────────────────*/
 
-    // BUY OFFER: Maker buys crypto for fiat, Taker sells crypto for fiat
-    //////////////////////////////////////////////////////////////////////
+    modifier onlyMaker(uint96 id) { require(msg.sender == deals[id].maker, "Not maker"); _; }
+    modifier onlyTaker(uint96 id) { require(msg.sender == deals[id].taker, "Not taker"); _; }
 
-    /// @dev Market maker makes buy crypto offer to market. Set amount to 0 to delete offer
-    /// @notice Only one offer per side per fiat for market maker
+    function _nextId() private returns (uint96 id) { unchecked { id = ++_dealSeq; } }
+
+    /// push ETH; если не удалось — кредитуем во внутренний счёт
+    function _sendOrCredit(address to, uint128 amt) internal {
+        if (amt == 0) return;
+        (bool ok, ) = to.call{value: amt, gas: 25_000}("");
+        if (ok) emit Payout(to, amt);
+        else {
+            pendingWithdraw[to] += amt;
+            emit PendingCredit(to, amt);
+        }
+    }
+
+    /// комиссия + партнёр
+    function _payoutWithFee(address taker, address to, uint128 amt) internal {
+        uint128 fee = uint128((amt * FEE_BPS) / 10_000);          // 0.1 %
+        uint128 net = amt - fee;
+
+        _sendOrCredit(to, net);                                   // основная выплата
+
+        address partner = affiliates[taker];
+        if (partner != address(0)) {
+            uint128 part = uint128((fee * AFF_SHARE_BP) / 10_000);
+            _sendOrCredit(partner, part);
+            _sendOrCredit(author, fee - part);
+        } else {
+            _sendOrCredit(author, fee);
+        }
+    }
+
+    /*──────────────────────────────────────────────────────*/
+    /*  MAKER PROFILE                                       */
+    /*──────────────────────────────────────────────────────*/
+
+    function setOnline(bool on) external {
+        makerProfile[msg.sender].online = on;
+        emit MakerOnline(msg.sender, on);
+    }
+
+    function setWorkingHours(uint8 startHour, uint8 endHour) external {
+        require(startHour < 24 && endHour < 24, "Hour 0-23");
+        makerProfile[msg.sender].startHour = startHour;
+        makerProfile[msg.sender].endHour   = endHour;
+        emit WorkingHoursSet(msg.sender, startHour, endHour);
+    }
+
+    /*──────────────────────────────────────────────────────*/
+    /*  OFFERS (BUY)                                        */
+    /*──────────────────────────────────────────────────────*/
+
     function maker_makeBuyOffer(
-        string fiat, // 'USD', 'EUR' etc.
-        uint price, // of 1e18 network token in fiat
-        uint reserve, // in fiat
-        uint minimumAmount, // of network token
-        uint maximumAmount, // of network token
-        string acceptedPaymentMethods, // comma-separated payment methods accepted by maker
-        string comment // text comment related to the offer
+        FiatCode fiat,
+        uint96   price,               // fiat per 1e18 native
+        uint96   reserveFiat,
+        uint128  minAmt,
+        uint128  maxAmt,
+        string calldata payMethods,
+        string calldata comment
     ) external {
-        // TODO
+        offers[msg.sender][fiat] = Offer({
+            minAmt:  minAmt,
+            maxAmt:  maxAmt,
+            reserveFiat: reserveFiat,
+            price:   price,
+            fiat:    fiat,
+            ts:      uint32(block.timestamp),
+            online:  makerProfile[msg.sender].online
+        });
+        emit OfferUpsert(msg.sender, fiat, offers[msg.sender][fiat], payMethods, comment);
     }
 
-    /// @dev Taker selects Marketmaker's offer and creates a deal
-    /// @dev amount in network token, fiat amount calculated under the hood
-    /// @dev paymentDetails should contain
-    /// @notice Taker should send amount*2 to contract (amount + 100% collateral)
-    function taker_selectBuyOffer(address maker, uint dealAmount, string fiat, string paymentDetails)
-    external payable {
-        // TODO
+    function maker_deleteBuyOffer(FiatCode fiat) external {
+        delete offers[msg.sender][fiat];
+        emit OfferDeleted(msg.sender, fiat);
     }
 
-    /// @dev Taker can cancel offer selection while Maker did not accept this selection
-    /// @dev Contract cancel the deal and refund amount and collateral to taker
-    function taker_cancelSelect(address maker)
-    external {
-        // TODO
+    /*──────────────────────────────────────────────────────*/
+    /*  SELECT  (тейкер)                                    */
+    /*──────────────────────────────────────────────────────*/
+
+    function taker_selectBuyOffer(
+        address  maker,
+        uint128  dealAmount,          // native, 1e18
+        FiatCode fiat,
+        string calldata paymentDetails,
+        address  partner              // аффилиат-кандидат
+    ) external payable {
+        Offer storage off = offers[maker][fiat];
+        require(off.maxAmt != 0,                  "No offer");
+        require(dealAmount >= off.minAmt && dealAmount <= off.maxAmt, "Out of bounds");
+        require(msg.value == dealAmount * 2,      "Need amount+collateral");
+
+        uint96 id = _nextId();
+        deals[id] = Deal({
+            amount: dealAmount,
+            price:  off.price,
+            state:  DealState.SELECTED,
+            maker:  maker,
+            taker:  msg.sender,
+            fiat:   fiat,
+            tsSelect: uint40(block.timestamp),
+            tsLast:   uint40(block.timestamp)
+        });
+
+        // записываем партнёра, если ещё не был
+        if (affiliates[msg.sender] == address(0) && partner != msg.sender && partner != address(0)) {
+            affiliates[msg.sender] = partner;
+            emit PartnerBound(msg.sender, partner);
+        }
+
+        emit DealSelected(id, maker, msg.sender, dealAmount, paymentDetails);
     }
 
-    /// @dev Maker cancels taker's selection
-    /// @dev Contract cancel the deal and refund amount and collateral to taker
-    /// @dev optionalMessage can contains cancellation reason for taker
-    function maker_cancelTaker(address taker, string optionalMessage)
-    external {
-        // TODO
+    /*──────────────────────────────────────────────────────*/
+    /*  CANCEL  (тейкер до акцепта)                         */
+    /*──────────────────────────────────────────────────────*/
+
+    function taker_cancelSelect(uint96 id, string calldata reason) external onlyTaker(id) {
+        Deal storage d = deals[id];
+        require(d.state == DealState.SELECTED, "Not selectable");
+
+        d.state  = DealState.CANCELED;
+        d.tsLast = uint40(block.timestamp);
+
+        _sendOrCredit(d.taker, uint128(d.amount * 2));           // вернуть и сумму, и залог
+
+        emit DealCanceled(id, reason);
     }
 
-    /// @dev Maker accepts taker's selection
-    /// @notice Maker should send amount of the deal as escrow collateral
-    /// @dev optionalMessage can contains information related to the deal
-    function maker_acceptTaker(address taker, string optionalMessage)
-    external payable {
-        // TODO
+    /*──────────────────────────────────────────────────────*/
+    /*  CANCEL  (maker до акцепта)                          */
+    /*──────────────────────────────────────────────────────*/
+
+    function maker_cancelTaker(uint96 id, string calldata reason) external onlyMaker(id) {
+        Deal storage d = deals[id];
+        require(d.state == DealState.SELECTED, "Already accepted");
+
+        d.state  = DealState.CANCELED;
+        d.tsLast = uint40(block.timestamp);
+
+        _sendOrCredit(d.taker, uint128(d.amount * 2));
+
+        emit DealCanceled(id, reason);
     }
 
-    /// @dev After deal
+    /*──────────────────────────────────────────────────────*/
+    /*  ACCEPT  (maker)                                     */
+    /*──────────────────────────────────────────────────────*/
 
-    /// @dev Maker can cancel the deal while he did not transferred fiat money
-    /// @dev for example when he have issues with bank transfer etc.
-    /// @dev Contract cancel the deal and returns collateral to maker and collateral+deal amount to taker
-    function maker_cancelDeal(address taker, string optionalMessage)
-    external {
-        // TODO
+    function maker_acceptTaker(uint96 id, string calldata msgForTaker) external payable onlyMaker(id) {
+        Deal storage d = deals[id];
+        require(d.state == DealState.SELECTED, "Wrong state");
+        require(msg.value == d.amount,         "Need collateral");
+
+        d.state  = DealState.ACCEPTED;
+        d.tsLast = uint40(block.timestamp);
+
+        emit DealAccepted(id, msgForTaker);
     }
 
-    /// @dev Maker should make payment to Taker's fiat account and mark deal as paid
-    function maker_markPaid(address taker, string optionalMessage)
-    external {
-        // TODO
+    /*──────────────────────────────────────────────────────*/
+    /*  CHAT                                                */
+    /*──────────────────────────────────────────────────────*/
+
+    function maker_sendMessage(uint96 id, string calldata text) external onlyMaker(id) {
+        require(deals[id].state == DealState.ACCEPTED || deals[id].state == DealState.PAID, "Chat closed");
+        emit Message(id, msg.sender, text);
     }
 
-    /// @dev Taker should check fiat received then release (close) the deal
-    /// @dev Contract deletes the deal, send deal amount to maker and returns both collaterals to sides
-    function taker_release(address maker)
-    external {
-        // TODO
+    function taker_sendMessage(uint96 id, string calldata text) external onlyTaker(id) {
+        require(deals[id].state == DealState.ACCEPTED || deals[id].state == DealState.PAID, "Chat closed");
+        emit Message(id, msg.sender, text);
     }
 
-    // SELL OFFER: Maker sells crypto for fiat, Taker buys crypto for fiat
-    //////////////////////////////////////////////////////////////////////
+    /*──────────────────────────────────────────────────────*/
+    /*  MAKER: cancel после accept (не перевёл деньги)      */
+    /*──────────────────────────────────────────────────────*/
 
+    function maker_cancelDeal(uint96 id, string calldata reason) external onlyMaker(id) {
+        Deal storage d = deals[id];
+        require(d.state == DealState.ACCEPTED, "Not accepted");
 
+        d.state  = DealState.CANCELED;
+        d.tsLast = uint40(block.timestamp);
 
+        // вернуть: тейкеру (amount+collateral), мейкеру collateral
+        _sendOrCredit(d.taker, uint128(d.amount * 2));
+        _sendOrCredit(d.maker, uint128(d.amount));
+
+        emit DealCanceled(id, reason);
+    }
+
+    /*──────────────────────────────────────────────────────*/
+    /*  MAKER → mark paid (fiat отправлен)                  */
+    /*──────────────────────────────────────────────────────*/
+
+    function maker_markPaid(uint96 id, string calldata msgForTaker) external onlyMaker(id) {
+        Deal storage d = deals[id];
+        require(d.state == DealState.ACCEPTED, "Wrong state");
+
+        d.state  = DealState.PAID;
+        d.tsLast = uint40(block.timestamp);
+
+        emit DealPaid(id, msgForTaker);
+    }
+
+    /*──────────────────────────────────────────────────────*/
+    /*  TAKER → release (успех сделки)                      */
+    /*──────────────────────────────────────────────────────*/
+
+    function taker_release(uint96 id) external onlyTaker(id) {
+        Deal storage d = deals[id];
+        require(d.state == DealState.PAID, "Not paid");
+        d.state  = DealState.RELEASED;
+        d.tsLast = uint40(block.timestamp);
+
+        // 1) выплата мейкеру (с комиссией)
+        _payoutWithFee(d.taker, d.maker, uint128(d.amount));
+
+        // 2) возврат залогов
+        _sendOrCredit(d.taker, uint128(d.amount));  // collateral тейкера
+        _sendOrCredit(d.maker, uint128(d.amount));  // collateral мейкера
+
+        emit DealReleased(id);
+    }
+
+    /*──────────────────────────────────────────────────────*/
+    /*  WITHDRAW (забрать кредиты)                          */
+    /*──────────────────────────────────────────────────────*/
+
+    function withdraw() external {
+        uint128 amt = pendingWithdraw[msg.sender];
+        require(amt != 0, "Zero");
+        pendingWithdraw[msg.sender] = 0;         // effects-before-interactions
+        (bool ok, ) = msg.sender.call{value: amt}("");
+        require(ok, "Withdraw failed");
+        emit Withdraw(msg.sender, amt);
+    }
+
+    /*──────────────────────────────────────────────────────*/
+    /*  FALLBACK                                            */
+    /*──────────────────────────────────────────────────────*/
+
+    receive() external payable {}    // контракт может принимать ETH напрямую
 }
