@@ -70,6 +70,7 @@ contract Swap2p {
     error NotMaker();
     error NotTaker();
     error WrongState();
+    error WrongSide();
     error OfferNotFound();
     error AmountOutOfBounds();
     error InsufficientDeposit();
@@ -285,7 +286,7 @@ contract Swap2p {
         emit DealSelected(id, s, maker, msg.sender, amount, details);
     }
 
-    /*────────────── CANCELS до accept ─────────────*/
+    /*────────────── CANCELS before accept ─────────────*/
     function taker_cancelSelect(uint96 id, string calldata reason) external onlyTaker(id) {
         Deal storage d = deals[id];
         if (d.state != DealState.SELECTED) revert WrongState();
@@ -329,19 +330,40 @@ contract Swap2p {
         emit Chat(id, msg.sender, t);
     }
 
-    /*────────────── MAKER CANCEL после accept ────*/
-    function maker_cancelDeal(uint96 id, string calldata reason) external onlyMaker(id) {
+    /*────────  MAKER CANCEL after accept  (BUY side) ───────*/
+    function maker_cancelDeal(uint96 id, string calldata reason)
+    external
+    onlyMaker(id)
+    {
         Deal storage d = deals[id];
         if (d.state != DealState.ACCEPTED) revert WrongState();
-        d.state = DealState.CANCELED;
+        if (d.side != Side.BUY) revert WrongSide();
+
+        d.state  = DealState.CANCELED;
         d.tsLast = uint40(block.timestamp);
-        if (d.side == Side.BUY) {
-            _sendOrCredit(d.taker, uint128(d.amount * 2));
-            _sendOrCredit(d.maker, uint128(d.amount));
-        } else {
-            _sendOrCredit(d.taker, uint128(d.amount));
-            _sendOrCredit(d.maker, uint128(d.amount * 2));
-        }
+
+        _sendOrCredit(d.taker, uint128(d.amount * 2));
+        _sendOrCredit(d.maker, uint128(d.amount));
+
+        _closeBoth(d.maker, d.taker, id);
+        emit DealCanceled(id, reason);
+    }
+
+    /*────────  TAKER CANCEL after accept  (SELL side) ─────*/
+    function taker_cancelDeal(uint96 id, string calldata reason)
+    external
+    onlyTaker(id)
+    {
+        Deal storage d = deals[id];
+        if (d.state != DealState.ACCEPTED) revert WrongState();
+        if (d.side != Side.SELL) revert WrongSide();
+
+        d.state  = DealState.CANCELED;
+        d.tsLast = uint40(block.timestamp);
+
+        _sendOrCredit(d.taker, uint128(d.amount));
+        _sendOrCredit(d.maker, uint128(d.amount * 2));
+
         _closeBoth(d.maker, d.taker, id);
         emit DealCanceled(id, reason);
     }
