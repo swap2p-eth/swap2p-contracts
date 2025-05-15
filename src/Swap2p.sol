@@ -175,36 +175,59 @@ contract Swap2p {
 
     /*────────────── SELECT (TAKER) ────────────────*/
     function taker_selectOffer(
-        Side s,address maker,uint128 amount,FiatCode f,
-        string calldata details,address partner
-    ) external payable{
-        Offer storage off = offers[maker][side][fiat];
+        Side      s,
+        address   maker,
+        uint128   amount,
+        FiatCode  f,
+        uint96    expectedPrice,
+        string calldata details,
+        address   partner
+    ) external payable {
+        Offer storage off = offers[maker][s][f];
         if (off.maxAmt == 0) revert OfferNotFound();
-        if (side == Side.BUY) {
+
+        /* защита от ухудшения цены */
+        if (s == Side.BUY) {
             if (off.priceFiatPerToken < expectedPrice) revert WorsePrice();
-        } else { // SELL
+        } else {
             if (off.priceFiatPerToken > expectedPrice) revert WorsePrice();
         }
+
         if (amount < off.minAmt || amount > off.maxAmt) revert AmountOutOfBounds();
-        if(amount<off.minAmt||amount>off.maxAmt) revert AmountOutOfBounds();
 
-        uint128 need=s==Side.BUY?amount*2:amount;
-        if(msg.value!=need) revert InsufficientDeposit();
+        /* —── резерв в фиате —── */
+        uint128 fiatDeal = _calcFiat(amount, off.priceFiatPerToken);
+        require(off.reserveFiat >= fiatDeal, "ReserveTooLow");
+        off.reserveFiat -= fiatDeal;                          // списываем
 
-        uint96 id=++_dealSeq;
-        deals[id]=Deal({
-            amount:amount,price:off.priceFiatPerToken,state:DealState.SELECTED,
-            side:s,maker:maker,taker:msg.sender,fiat:f,
-            tsSelect:uint40(block.timestamp),tsLast:uint40(block.timestamp)
+        uint128 need = s == Side.BUY ? amount * 2 : amount;
+        if (msg.value != need) revert InsufficientDeposit();
+
+        uint96 id = ++_dealSeq;
+        deals[id] = Deal({
+            amount:   amount,
+            price:    off.priceFiatPerToken,
+            state:    DealState.SELECTED,
+            side:     s,
+            maker:    maker,
+            taker:    msg.sender,
+            fiat:     f,
+            tsSelect: uint40(block.timestamp),
+            tsLast:   uint40(block.timestamp)
         });
-        _addOpen(maker,id); _addOpen(msg.sender,id);
 
-        if(affiliates[msg.sender]==address(0)&&partner!=address(0)){
-            if(partner==msg.sender) revert SelfPartnerNotAllowed();
-            affiliates[msg.sender]=partner; emit PartnerBound(msg.sender,partner);
+        _addOpen(maker, id);
+        _addOpen(msg.sender, id);
+
+        if (affiliates[msg.sender] == address(0) && partner != address(0)) {
+            if (partner == msg.sender) revert SelfPartnerNotAllowed();
+            affiliates[msg.sender] = partner;
+            emit PartnerBound(msg.sender, partner);
         }
-        emit DealSelected(id,s,maker,msg.sender,amount,details);
+
+        emit DealSelected(id, s, maker, msg.sender, amount, details);
     }
+
 
     /*────────────── CANCELS до accept ─────────────*/
     function taker_cancelSelect(uint96 id,string calldata reason) external onlyTaker(id){
