@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
-/*╔════════════════════════════════════════════════════╗*\
-|*║   Swap2p – non-custodial native-to-fiat P2P market ║*|
-\*╚════════════════════════════════════════════════════╝*/
-
+/// @title Swap2p – non-custodial native-to-fiat P2P market
 contract Swap2p {
-    /*────────────── CONSTANTS / TYPES ───────────────*/
-
     uint32 public constant FEE_BPS = 10; // 0,10 %
-    uint32 public constant AFF_SHARE_BP = 2000; // 20 % от комиссии
+    uint32 public constant AFF_SHARE_BP = 2000; // 20 % from fee
 
     type FiatCode is uint24;
 
@@ -54,7 +49,6 @@ contract Swap2p {
         uint8 endHourUTC;
     }
 
-    /*────────────── STORAGE ─────────────────────────*/
 
     address public immutable author;
     uint96 private _dealSeq;
@@ -67,12 +61,11 @@ contract Swap2p {
     mapping(address => MakerProfile) public makerInfo;
 
     mapping(Side => mapping(FiatCode => address[])) private _offerKeys;
-    mapping(address => mapping(Side => mapping(FiatCode => uint256))) private _offerPos; // +1
+    mapping(address => mapping(Side => mapping(FiatCode => uint))) private _offerPos; // +1
 
     mapping(address => uint96[]) private _openDeals;
-    mapping(address => mapping(uint96 => uint256)) private _openPos; // +1
+    mapping(address => mapping(uint96 => uint)) private _openPos; // +1
 
-    /*────────────── ERRORS ──────────────────────────*/
 
     error NotMaker();
     error NotTaker();
@@ -88,7 +81,6 @@ contract Swap2p {
     error Reentrancy();
     error WorsePrice();
 
-    /*────────────── EVENTS (без изменений) ─────────*/
 
     event OfferUpsert(address indexed maker, Side side, FiatCode fiat, Offer offer, string payMethods, string comment);
     event OfferDeleted(address indexed maker, Side side, FiatCode fiat);
@@ -112,7 +104,6 @@ contract Swap2p {
     event MakerOnline(address indexed maker, bool online);
     event WorkingHoursSet(address indexed maker, uint8 startUTC, uint8 endUTC);
 
-    /*────────────── CONSTRUCTOR ────────────────────*/
     constructor() payable {
         author = msg.sender;
     }
@@ -137,11 +128,11 @@ contract Swap2p {
     }
 
     function _removeOfferKey(address m, Side s, FiatCode f) private {
-        uint256 pos = _offerPos[m][s][f];
+        uint pos = _offerPos[m][s][f];
         if (pos == 0) return;
         address[] storage arr = _offerKeys[s][f];
-        uint256 idx = pos - 1;
-        uint256 last = arr.length - 1;
+        uint idx = pos - 1;
+        uint last = arr.length - 1;
         if (idx != last) {
             address lastA = arr[last];
             arr[idx] = lastA;
@@ -158,11 +149,11 @@ contract Swap2p {
     }
 
     function _removeOpen(address u, uint96 id) private {
-        uint256 pos = _openPos[u][id];
+        uint pos = _openPos[u][id];
         if (pos == 0) return;
-        uint256 idx = pos - 1;
+        uint idx = pos - 1;
         uint96[] storage arr = _openDeals[u];
-        uint256 last = arr.length - 1;
+        uint last = arr.length - 1;
         if (idx != last) {
             uint96 lastId = arr[last];
             arr[idx] = lastId;
@@ -258,7 +249,6 @@ contract Swap2p {
         Offer storage off = offers[maker][s][f];
         if (off.maxAmt == 0) revert OfferNotFound();
 
-        /* защита от ухудшения цены */
         if (s == Side.BUY) {
             if (off.priceFiatPerToken < expectedPrice) revert WorsePrice();
         } else {
@@ -397,43 +387,43 @@ contract Swap2p {
     }
 
     /*────────────── READERS  ───────────*/
-    function getOfferCount(Side s, FiatCode f) external view returns (uint256) {
+    function getOfferCount(Side s, FiatCode f) external view returns (uint) {
         return _offerKeys[s][f].length;
     }
 
-    function getOfferKeys(Side s, FiatCode f, uint256 off, uint256 lim) external view returns (address[] memory out) {
+    function getOfferKeys(Side s, FiatCode f, uint off, uint lim) external view returns (address[] memory out) {
         address[] storage arr = _offerKeys[s][f];
-        uint256 len = arr.length;
+        uint len = arr.length;
         if (off >= len) return new address[](0);
-        uint256 end = off + lim;
+        uint end = off + lim;
         if (end > len) end = len;
         out = new address[](end - off);
-        for (uint256 i = off; i < end; ++i) {
+        for (uint i = off; i < end; ++i) {
             out[i - off] = arr[i];
         }
     }
 
-    function getOpenDealCount(address u) external view returns (uint256) {
+    function getOpenDealCount(address u) external view returns (uint) {
         return _openDeals[u].length;
     }
 
-    function getOpenDeals(address u, uint256 off, uint256 lim) external view returns (uint96[] memory out) {
+    function getOpenDeals(address u, uint off, uint lim) external view returns (uint96[] memory out) {
         uint96[] storage arr = _openDeals[u];
-        uint256 len = arr.length;
+        uint len = arr.length;
         if (off >= len) return new uint96[](0);
-        uint256 end = off + lim;
+        uint end = off + lim;
         if (end > len) end = len;
         out = new uint96[](end - off);
-        for (uint256 i = off; i < end; ++i) {
+        for (uint i = off; i < end; ++i) {
             out[i - off] = arr[i];
         }
     }
 
     function areMakersAvailable(address[] calldata m) external view returns (bool[] memory a) {
-        uint256 len = m.length;
+        uint len = m.length;
         a = new bool[](len);
         uint8 h = uint8((block.timestamp / 1 hours) % 24);
-        for (uint256 i; i < len; ++i) {
+        for (uint i; i < len; ++i) {
             MakerProfile storage p = makerInfo[m[i]];
             if (!p.online) continue;
             a[i] = p.startHourUTC <= p.endHourUTC
