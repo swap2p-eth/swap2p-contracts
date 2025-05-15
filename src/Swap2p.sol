@@ -1,30 +1,28 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
-/*╔════════════════════════════════════════════════════════════════════╗*\
-║   Swap2p – non-custodial P2P swap of the native coin against fiat   ║
-\*╚════════════════════════════════════════════════════════════════════╝*/
+/*╔════════════════════════════════════════════════════╗*\
+║   Swap2p – non-custodial native-to-fiat P2P market  ║
+\*╚════════════════════════════════════════════════════╝*/
 
 contract Swap2p {
-    /*──────────────────────── CONSTANTS / TYPES ───────────────────────────*/
+    /*────────────── CONSTANTS / TYPES ───────────────*/
 
     uint32 public constant FEE_BPS      = 10;      // 0,10 %
     uint32 public constant AFF_SHARE_BP = 2000;    // 20 % от комиссии
 
-    type FiatCode is uint24;                       // "USD" → 0x555344
-
-    enum Side      { BUY, SELL }                   // намерение мейкера
+    type FiatCode is uint24;
+    enum Side { BUY, SELL }
     enum DealState { NONE, SELECTED, ACCEPTED, PAID, RELEASED, CANCELED }
 
     struct Offer {
         uint128 minAmt;
         uint128 maxAmt;
         uint96  reserveFiat;
-        uint96  priceFiatPerToken;   // цена 1 e18 нативной монеты
+        uint96  priceFiatPerToken;
         FiatCode fiat;
         uint32  ts;
         Side    side;
-        bool    makerOnline;
     }
 
     struct Deal {
@@ -41,40 +39,29 @@ contract Swap2p {
 
     struct MakerProfile {
         bool  online;
-        uint8 startHourUTC;          // 0-23
-        uint8 endHourUTC;            // 0-23
+        uint8 startHourUTC;
+        uint8 endHourUTC;
     }
 
-    /*──────────────────────────── STORAGE ─────────────────────────────────*/
+    /*────────────── STORAGE ─────────────────────────*/
 
     address public immutable author;
-    uint96  private  _dealSeq;
+    uint96  private _dealSeq;
 
-    // (maker ⇒ side ⇒ fiat) → Offer
     mapping(address => mapping(Side => mapping(FiatCode => Offer))) public offers;
-    // id → Deal
     mapping(uint96  => Deal) public deals;
 
-    // native кредиты, если push не прошёл
     mapping(address => uint128) public pending;
-
-    // партнёрская программа (только для тейкеров)
     mapping(address => address) public affiliates;
-
-    // профиль мейкера
     mapping(address => MakerProfile) public makerInfo;
 
-    /*─── 1. Реестр активных оферов  ───────────────────────────────────────*/
-
-    mapping(Side => mapping(FiatCode => address[]))                 private _offerKeys;
+    mapping(Side => mapping(FiatCode => address[])) private _offerKeys;
     mapping(address => mapping(Side => mapping(FiatCode => uint256))) private _offerPos; // +1
 
-    /*─── 2. Реестр открытых сделок по адресу ──────────────────────────────*/
+    mapping(address => uint96[])  private _openDeals;
+    mapping(address => mapping(uint96 => uint256))   private _openPos; // +1
 
-    mapping(address => uint96[])                  private _openDeals;
-    mapping(address => mapping(uint96 => uint256)) private _openPos; // +1
-
-    /*──────────────────────────── ERRORS ──────────────────────────────────*/
+    /*────────────── ERRORS ──────────────────────────*/
 
     error NotMaker();
     error NotTaker();
@@ -87,13 +74,13 @@ contract Swap2p {
     error WithdrawFailed();
     error SelfPartnerNotAllowed();
     error NotFiatPayer();
+    error Reentrancy();
 
-    /*──────────────────────────── EVENTS ──────────────────────────────────*/
+    /*────────────── EVENTS (без изменений) ─────────*/
 
     event OfferUpsert(address indexed maker, Side side, FiatCode fiat, Offer offer,
         string payMethods, string comment);
     event OfferDeleted(address indexed maker, Side side, FiatCode fiat);
-
     event DealSelected(uint96 indexed id, Side side, address indexed maker,
         address indexed taker, uint128 amount, string paymentDetails);
     event DealCanceled(uint96 indexed id, string reason);
@@ -101,406 +88,210 @@ contract Swap2p {
     event DealPaid(uint96 indexed id, string message);
     event DealReleased(uint96 indexed id);
     event Chat(uint96 indexed id, address indexed from, string text);
-
     event Payout(address indexed to, uint128 amount);
     event PendingCredit(address indexed to, uint128 amount);
     event Withdraw(address indexed to, uint128 amount);
-
     event PartnerBound(address indexed taker, address indexed partner);
     event MakerOnline(address indexed maker, bool online);
     event WorkingHoursSet(address indexed maker, uint8 startUTC, uint8 endUTC);
 
-    /*────────────────────────── CONSTRUCTOR ───────────────────────────────*/
+    /*────────────── CONSTRUCTOR ────────────────────*/
+    constructor() payable { author = msg.sender; }
 
-    constructor() payable {
-        author = msg.sender;
-    }
+    /*────────────── MODIFIERS ──────────────────────*/
+    modifier onlyMaker(uint96 id){ if(msg.sender!=deals[id].maker) revert NotMaker(); _;}
+    modifier onlyTaker(uint96 id){ if(msg.sender!=deals[id].taker) revert NotTaker(); _;}
 
-    /*──────────────────── INTERNAL / MODIFIERS / HELPERS ──────────────────*/
-
-    modifier onlyMaker(uint96 id) {
-        if (msg.sender != deals[id].maker) revert NotMaker();
-        _;
-    }
-    modifier onlyTaker(uint96 id) {
-        if (msg.sender != deals[id].taker) revert NotTaker();
-        _;
-    }
-
-    function _nextId() private returns (uint96 id) {
-        unchecked { id = ++_dealSeq; }
-    }
-
-    /*─── offer registry helpers ───────────────────────────────────────────*/
-
-    function _addOfferKey(address maker, Side side, FiatCode fiat) private {
-        if (_offerPos[maker][side][fiat] == 0) {
-            _offerPos[maker][side][fiat] = _offerKeys[side][fiat].length + 1;
-            _offerKeys[side][fiat].push(maker);
+    /*────────────── OFFER-KEY HELPERS ──────────────*/
+    function _addOfferKey(address m, Side s, FiatCode f) private {
+        if (_offerPos[m][s][f]==0){
+            _offerPos[m][s][f]=_offerKeys[s][f].length+1;
+            _offerKeys[s][f].push(m);
         }
     }
-    function _removeOfferKey(address maker, Side side, FiatCode fiat) private {
-        uint256 pos = _offerPos[maker][side][fiat];
-        if (pos == 0) return;                   // уже нет
-        uint256 idx = pos - 1;
-        address[] storage arr = _offerKeys[side][fiat];
-        uint256 last = arr.length - 1;
-        if (idx != last) {
-            address lastAddr = arr[last];
-            arr[idx] = lastAddr;
-            _offerPos[lastAddr][side][fiat] = pos;
-        }
-        arr.pop();
-        delete _offerPos[maker][side][fiat];
+    function _removeOfferKey(address m, Side s, FiatCode f) private {
+        uint pos=_offerPos[m][s][f]; if(pos==0) return;
+        address[] storage arr=_offerKeys[s][f];
+        uint idx=pos-1; uint last=arr.length-1;
+        if(idx!=last){ address lastA=arr[last]; arr[idx]=lastA; _offerPos[lastA][s][f]=pos;}
+        arr.pop(); delete _offerPos[m][s][f];
     }
 
-    /*─── open-deal registry helpers ───────────────────────────────────────*/
-
-    function _addOpenDeal(address user, uint96 id) private {
-        _openPos[user][id] = _openDeals[user].length + 1;
-        _openDeals[user].push(id);
+    /*────────────── OPEN-DEAL HELPERS ──────────────*/
+    function _addOpen(address u,uint96 id) private { _openPos[u][id]=_openDeals[u].length+1; _openDeals[u].push(id); }
+    function _removeOpen(address u,uint96 id) private {
+        uint pos=_openPos[u][id]; if(pos==0)return;
+        uint idx=pos-1; uint96[] storage arr=_openDeals[u];
+        uint last=arr.length-1;
+        if(idx!=last){ uint96 lastId=arr[last]; arr[idx]=lastId; _openPos[u][lastId]=pos;}
+        arr.pop(); delete _openPos[u][id];
     }
-    function _removeOpenDeal(address user, uint96 id) private {
-        uint256 pos = _openPos[user][id];
-        if (pos == 0) return;
-        uint256 idx = pos - 1;
-        uint96[] storage arr = _openDeals[user];
-        uint256 last = arr.length - 1;
-        if (idx != last) {
-            uint96 lastId = arr[last];
-            arr[idx] = lastId;
-            _openPos[user][lastId] = pos;
-        }
-        arr.pop();
-        delete _openPos[user][id];
-    }
-    function _closeDealForBoth(address maker, address taker, uint96 id) private {
-        _removeOpenDeal(maker, id);
-        _removeOpenDeal(taker, id);
-    }
+    function _closeBoth(address m,address t,uint96 id) private { _removeOpen(m,id); _removeOpen(t,id); }
 
-    /*─── payment helpers ──────────────────────────────────────────────────*/
-
-    function _sendOrCredit(address to, uint128 amt) internal {
-        if (amt == 0) return;
-        (bool ok, ) = to.call{value: amt, gas: 25_000}("");
-        if (ok) emit Payout(to, amt);
-        else { pending[to] += amt; emit PendingCredit(to, amt); }
+    /*────────────── PAYMENTS ───────────────────────*/
+    function _sendOrCredit(address to,uint128 amt) internal{
+        if(amt==0)return;
+        (bool ok,)=to.call{value:amt,gas:50_000}("");
+        if(ok) emit Payout(to,amt); else{ pending[to]+=amt; emit PendingCredit(to,amt);}
+    }
+    function _payWithFee(address taker,address to,uint128 amt) internal{
+        uint128 fee=uint128((amt*FEE_BPS)/10_000);
+        _sendOrCredit(to,amt-fee);
+        address p=affiliates[taker];
+        if(p!=address(0)){ uint128 share=uint128((fee*AFF_SHARE_BP)/10_000);
+            _sendOrCredit(p,share); _sendOrCredit(author,fee-share);}
+        else _sendOrCredit(author,fee);
     }
 
-    function _payWithFee(address taker, address recipient, uint128 amt) internal {
-        uint128 fee = uint128((amt * FEE_BPS) / 10_000);
-        uint128 net = amt - fee;
-
-        _sendOrCredit(recipient, net);
-
-        address partner = affiliates[taker];
-        if (partner != address(0)) {
-            uint128 share = uint128((fee * AFF_SHARE_BP) / 10_000);
-            _sendOrCredit(partner, share);
-            _sendOrCredit(author, fee - share);
-        } else {
-            _sendOrCredit(author, fee);
-        }
+    /*────────────── MAKER PROFILE ─────────────────*/
+    function setOnline(bool on) external{ makerInfo[msg.sender].online=on; emit MakerOnline(msg.sender,on);}
+    function setWorkingHours(uint8 s,uint8 e) external{
+        if(s>=24||e>=24) revert InvalidHour();
+        makerInfo[msg.sender].startHourUTC=s; makerInfo[msg.sender].endHourUTC=e;
+        emit WorkingHoursSet(msg.sender,s,e);
     }
 
-    /*───────────────────── MAKER PROFILE  (не менялось) ───────────────────*/
-
-    function setOnline(bool on) external {
-        makerInfo[msg.sender].online = on;
-        emit MakerOnline(msg.sender, on);
-    }
-    function setWorkingHours(uint8 startUTC, uint8 endUTC) external {
-        if (startUTC >= 24 || endUTC >= 24) revert InvalidHour();
-        makerInfo[msg.sender].startHourUTC = startUTC;
-        makerInfo[msg.sender].endHourUTC   = endUTC;
-        emit WorkingHoursSet(msg.sender, startUTC, endUTC);
-    }
-
-    /*────────────────────── OFFER MANAGEMENT (add + key) ──────────────────*/
-
+    /*────────────── OFFER MANAGEMENT ──────────────*/
     function maker_makeOffer(
-        Side      side,
-        FiatCode  fiat,
-        uint96    priceFiatPerToken,
-        uint96    reserveFiat,
-        uint128   minAmt,
-        uint128   maxAmt,
-        string calldata payMethods,
-        string calldata comment
-    ) external {
-        // добавить в массив, если ранее не было
-        _addOfferKey(msg.sender, side, fiat);
-
-        offers[msg.sender][side][fiat] = Offer({
-            minAmt:  minAmt,
-            maxAmt:  maxAmt,
-            reserveFiat: reserveFiat,
-            priceFiatPerToken: priceFiatPerToken,
-            fiat:    fiat,
-            ts:      uint32(block.timestamp),
-            side:    side,
-            makerOnline: makerInfo[msg.sender].online
+        Side s, FiatCode f, uint96 price, uint96 reserveFiat,
+        uint128 minAmt,uint128 maxAmt,
+        string calldata pay,string calldata comment
+    ) external{
+        _addOfferKey(msg.sender,s,f);
+        offers[msg.sender][s][f]=Offer({
+            minAmt:minAmt,maxAmt:maxAmt,reserveFiat:reserveFiat,
+            priceFiatPerToken:price,fiat:f,ts:uint32(block.timestamp),side:s
         });
-
-        emit OfferUpsert(msg.sender, side, fiat,
-            offers[msg.sender][side][fiat], payMethods, comment);
+        emit OfferUpsert(msg.sender,s,f,offers[msg.sender][s][f],pay,comment);
     }
 
-    function maker_deleteOffer(Side side, FiatCode fiat) external {
-        delete offers[msg.sender][side][fiat];
-        _removeOfferKey(msg.sender, side, fiat);
-        emit OfferDeleted(msg.sender, side, fiat);
+    /// «Мягкое» удаление: офер обнуляется, ключ выходит из массива только когда нет открытых сделок
+    function maker_deleteOffer(Side s,FiatCode f) external{
+        delete offers[msg.sender][s][f];
+        if(_openDeals[msg.sender].length==0){ _removeOfferKey(msg.sender,s,f); }
+        emit OfferDeleted(msg.sender,s,f);
     }
 
-    /*──────────── SELECT (TAKER) – добавляем openDeals ────────────────────*/
-
+    /*────────────── SELECT (TAKER) ────────────────*/
     function taker_selectOffer(
-        Side      side,
-        address   maker,
-        uint128   amount,
-        FiatCode  fiat,
-        string calldata paymentDetails,
-        address   partner
-    ) external payable {
-        Offer storage off = offers[maker][side][fiat];
-        if (off.maxAmt == 0) revert OfferNotFound();
-        if (amount < off.minAmt || amount > off.maxAmt) revert AmountOutOfBounds();
+        Side s,address maker,uint128 amount,FiatCode f,
+        string calldata details,address partner
+    ) external payable{
+        Offer storage off=offers[maker][s][f];
+        if(off.maxAmt==0) revert OfferNotFound();
+        if(amount<off.minAmt||amount>off.maxAmt) revert AmountOutOfBounds();
 
-        uint128 takerDeposit = side == Side.BUY ? amount * 2 : amount;
-        if (msg.value != takerDeposit) revert InsufficientDeposit();
+        uint128 need=s==Side.BUY?amount*2:amount;
+        if(msg.value!=need) revert InsufficientDeposit();
 
-        uint96 id = _nextId();
-        deals[id] = Deal({
-            amount: amount,
-            price:  off.priceFiatPerToken,
-            state:  DealState.SELECTED,
-            side:   side,
-            maker:  maker,
-            taker:  msg.sender,
-            fiat:   fiat,
-            tsSelect: uint40(block.timestamp),
-            tsLast:   uint40(block.timestamp)
+        uint96 id=++_dealSeq;
+        deals[id]=Deal({
+            amount:amount,price:off.priceFiatPerToken,state:DealState.SELECTED,
+            side:s,maker:maker,taker:msg.sender,fiat:f,
+            tsSelect:uint40(block.timestamp),tsLast:uint40(block.timestamp)
         });
+        _addOpen(maker,id); _addOpen(msg.sender,id);
 
-        _addOpenDeal(maker, id);
-        _addOpenDeal(msg.sender, id);
-
-        if (affiliates[msg.sender] == address(0) && partner != address(0)) {
-            if (partner == msg.sender) revert SelfPartnerNotAllowed();
-            affiliates[msg.sender] = partner;
-            emit PartnerBound(msg.sender, partner);
+        if(affiliates[msg.sender]==address(0)&&partner!=address(0)){
+            if(partner==msg.sender) revert SelfPartnerNotAllowed();
+            affiliates[msg.sender]=partner; emit PartnerBound(msg.sender,partner);
         }
-
-        emit DealSelected(id, side, maker, msg.sender, amount, paymentDetails);
+        emit DealSelected(id,s,maker,msg.sender,amount,details);
     }
 
-    /*─────────── CANCELLATIONS BEFORE ACCEPT  (close lists) ───────────────*/
-
-    function taker_cancelSelect(uint96 id, string calldata reason)
-    external onlyTaker(id)
-    {
-        Deal storage d = deals[id];
-        if (d.state != DealState.SELECTED) revert WrongState();
-
-        d.state  = DealState.CANCELED;
-        d.tsLast = uint40(block.timestamp);
-
-        uint128 refund = d.side == Side.BUY ? d.amount * 2 : d.amount;
-        _sendOrCredit(d.taker, refund);
-        _closeDealForBoth(d.maker, d.taker, id);
-
-        emit DealCanceled(id, reason);
+    /*────────────── CANCELS до accept ─────────────*/
+    function taker_cancelSelect(uint96 id,string calldata reason) external onlyTaker(id){
+        Deal storage d=deals[id]; if(d.state!=DealState.SELECTED) revert WrongState();
+        d.state=DealState.CANCELED; d.tsLast=uint40(block.timestamp);
+        _sendOrCredit(d.taker,d.side==Side.BUY?uint128(d.amount*2):uint128(d.amount));
+        _closeBoth(d.maker,d.taker,id); emit DealCanceled(id,reason);
+    }
+    function maker_cancelTaker(uint96 id,string calldata reason) external onlyMaker(id){
+        Deal storage d=deals[id]; if(d.state!=DealState.SELECTED) revert WrongState();
+        d.state=DealState.CANCELED; d.tsLast=uint40(block.timestamp);
+        _sendOrCredit(d.taker,d.side==Side.BUY?uint128(d.amount*2):uint128(d.amount));
+        _closeBoth(d.maker,d.taker,id); emit DealCanceled(id,reason);
     }
 
-    function maker_cancelTaker(uint96 id, string calldata reason)
-    external onlyMaker(id)
-    {
-        Deal storage d = deals[id];
-        if (d.state != DealState.SELECTED) revert WrongState();
-
-        d.state  = DealState.CANCELED;
-        d.tsLast = uint40(block.timestamp);
-
-        uint128 refund = d.side == Side.BUY ? d.amount * 2 : d.amount;
-        _sendOrCredit(d.taker, refund);
-        _closeDealForBoth(d.maker, d.taker, id);
-
-        emit DealCanceled(id, reason);
+    /*────────────── ACCEPT / CHAT ────────────────*/
+    function maker_acceptTaker(uint96 id,string calldata msg_) external payable onlyMaker(id){
+        Deal storage d=deals[id]; if(d.state!=DealState.SELECTED) revert WrongState();
+        uint128 need=d.side==Side.BUY?d.amount:d.amount*2;
+        if(msg.value!=need) revert InsufficientDeposit();
+        d.state=DealState.ACCEPTED; d.tsLast=uint40(block.timestamp);
+        emit DealAccepted(id,msg_);
+    }
+    function maker_sendMessage(uint96 id,string calldata t) external onlyMaker(id){
+        DealState st=deals[id].state; if(st!=DealState.ACCEPTED&&st!=DealState.PAID) revert WrongState();
+        emit Chat(id,msg.sender,t);
+    }
+    function taker_sendMessage(uint96 id,string calldata t) external onlyTaker(id){
+        DealState st=deals[id].state; if(st!=DealState.ACCEPTED&&st!=DealState.PAID) revert WrongState();
+        emit Chat(id,msg.sender,t);
     }
 
-    /*───────── ACCEPT, CHAT – без изменений в списках ─────────────────────*/
-
-    function maker_acceptTaker(uint96 id, string calldata msgForTaker)
-    external payable onlyMaker(id)
-    {
-        Deal storage d = deals[id];
-        if (d.state != DealState.SELECTED) revert WrongState();
-
-        uint128 need = d.side == Side.BUY ? d.amount : d.amount * 2;
-        if (msg.value != need) revert InsufficientDeposit();
-
-        d.state  = DealState.ACCEPTED;
-        d.tsLast = uint40(block.timestamp);
-        emit DealAccepted(id, msgForTaker);
+    /*────────────── MAKER CANCEL после accept ────*/
+    function maker_cancelDeal(uint96 id,string calldata reason) external onlyMaker(id){
+        Deal storage d=deals[id]; if(d.state!=DealState.ACCEPTED) revert WrongState();
+        d.state=DealState.CANCELED; d.tsLast=uint40(block.timestamp);
+        if(d.side==Side.BUY){ _sendOrCredit(d.taker,uint128(d.amount*2)); _sendOrCredit(d.maker,uint128(d.amount)); }
+        else{ _sendOrCredit(d.taker,uint128(d.amount)); _sendOrCredit(d.maker,uint128(d.amount*2)); }
+        _closeBoth(d.maker,d.taker,id); emit DealCanceled(id,reason);
     }
 
-    function maker_sendMessage(uint96 id, string calldata text)
-    external onlyMaker(id)
-    { DealState st = deals[id].state;
-        if (st != DealState.ACCEPTED && st != DealState.PAID) revert WrongState();
-        emit Chat(id, msg.sender, text); }
-
-    function taker_sendMessage(uint96 id, string calldata text)
-    external onlyTaker(id)
-    { DealState st = deals[id].state;
-        if (st != DealState.ACCEPTED && st != DealState.PAID) revert WrongState();
-        emit Chat(id, msg.sender, text); }
-
-    /*────────  MAKER CANCEL AFTER ACCEPT  (close lists) ───────────────────*/
-
-    function maker_cancelDeal(uint96 id, string calldata reason)
-    external onlyMaker(id)
-    {
-        Deal storage d = deals[id];
-        if (d.state != DealState.ACCEPTED) revert WrongState();
-
-        d.state  = DealState.CANCELED;
-        d.tsLast = uint40(block.timestamp);
-
-        if (d.side == Side.BUY) {
-            _sendOrCredit(d.taker, uint128(d.amount * 2));
-            _sendOrCredit(d.maker, uint128(d.amount));
-        } else {
-            _sendOrCredit(d.taker, uint128(d.amount));
-            _sendOrCredit(d.maker, uint128(d.amount * 2));
-        }
-        _closeDealForBoth(d.maker, d.taker, id);
-
-        emit DealCanceled(id, reason);
+    /*────────────── MARK PAID ─────────────────────*/
+    function markFiatPaid(uint96 id,string calldata msg_) external{
+        Deal storage d=deals[id]; if(d.state!=DealState.ACCEPTED) revert WrongState();
+        if((d.side==Side.BUY&&msg.sender!=d.maker)||(d.side==Side.SELL&&msg.sender!=d.taker)) revert NotFiatPayer();
+        d.state=DealState.PAID; d.tsLast=uint40(block.timestamp); emit DealPaid(id,msg_);
     }
 
-    /*──────────────  MARK FIAT PAID  (без изменений) ───────────────────────*/
+    /*────────────── RELEASE ───────────────────────*/
+    function release(uint96 id) external{
+        Deal storage d=deals[id]; if(d.state!=DealState.PAID) revert WrongState();
+        if((d.side==Side.BUY&&msg.sender!=d.taker)||(d.side==Side.SELL&&msg.sender!=d.maker)) revert NotTaker();
 
-    function markFiatPaid(uint96 id, string calldata msg_) external {
-        Deal storage d = deals[id];
-        if (d.state != DealState.ACCEPTED) revert WrongState();
+        d.state=DealState.RELEASED; d.tsLast=uint40(block.timestamp);
+        _closeBoth(d.maker,d.taker,id);
 
-        if ((d.side == Side.BUY  && msg.sender != d.maker) ||
-            (d.side == Side.SELL && msg.sender != d.taker))
-            revert NotFiatPayer();
-
-        d.state  = DealState.PAID;
-        d.tsLast = uint40(block.timestamp);
-        emit DealPaid(id, msg_);
-    }
-
-    /*──────────────────── RELEASE  (close lists, payouts) ──────────────────*/
-
-    function release(uint96 id) external {
-        Deal storage d = deals[id];
-        if (d.state != DealState.PAID) revert WrongState();
-
-        if ((d.side == Side.BUY  && msg.sender != d.taker) ||
-            (d.side == Side.SELL && msg.sender != d.maker))
-            revert NotTaker();
-
-        d.state  = DealState.RELEASED;
-        d.tsLast = uint40(block.timestamp);
-
-        address recipient = d.side == Side.BUY ? d.maker : d.taker;
-        _payWithFee(d.taker, recipient, uint128(d.amount));
-
-        _sendOrCredit(d.taker, uint128(d.amount));
-        _sendOrCredit(d.maker, uint128(d.amount));
-
-        _closeDealForBoth(d.maker, d.taker, id);
-
+        _payWithFee(d.taker,d.side==Side.BUY?d.maker:d.taker,uint128(d.amount));
+        _sendOrCredit(d.taker,uint128(d.amount));
+        _sendOrCredit(d.maker,uint128(d.amount));
         emit DealReleased(id);
     }
 
-    /*─────────────────────────── WITHDRAW ─────────────────────────────────*/
-
-    function withdraw() external {
-        uint128 amt = pending[msg.sender];
-        if (amt == 0) revert WithdrawZero();
-        pending[msg.sender] = 0;
-        (bool ok, ) = msg.sender.call{value: amt}("");
-        if (!ok) revert WithdrawFailed();
-        emit Withdraw(msg.sender, amt);
+    /*────────────── WITHDRAW ──────────────────────*/
+    uint private _entered;
+    function withdraw() external{
+        if(_entered==1) revert Reentrancy(); _entered=1;
+        uint128 amt=pending[msg.sender]; if(amt==0){ _entered=0; revert WithdrawZero();}
+        pending[msg.sender]=0;
+        (bool ok,)=msg.sender.call{value:amt}("");
+        _entered=0; if(!ok) revert WithdrawFailed();
+        emit Withdraw(msg.sender,amt);
     }
 
-    /*─────────────────────────── READERS ───────────────────────────────────*/
-
-    // 1) ордер-бук
-    function getOfferCount(Side side, FiatCode fiat) external view returns (uint256) {
-        return _offerKeys[side][fiat].length;
+    /*────────────── READERS (как было) ───────────*/
+    function getOfferCount(Side s,FiatCode f) external view returns(uint){ return _offerKeys[s][f].length; }
+    function getOfferKeys(Side s,FiatCode f,uint off,uint lim) external view returns(address[] memory out){
+        address[] storage arr=_offerKeys[s][f]; uint len=arr.length;
+        if(off>=len) return new address[](0); uint end=off+lim; if(end>len) end=len;
+        out=new address[](end-off); for(uint i=off;i<end;++i) out[i-off]=arr[i];
+    }
+    function getOpenDealCount(address u) external view returns(uint){ return _openDeals[u].length; }
+    function getOpenDeals(address u,uint off,uint lim) external view returns(uint96[] memory out){
+        uint96[] storage arr=_openDeals[u]; uint len=arr.length;
+        if(off>=len) return new uint96[](0); uint end=off+lim; if(end>len) end=len;
+        out=new uint96[](end-off); for(uint i=off;i<end;++i) out[i-off]=arr[i];
+    }
+    function areMakersAvailable(address[] calldata m) external view returns(bool[] memory a){
+        uint len=m.length; a=new bool[](len); uint8 h=uint8((block.timestamp/1 hours)%24);
+        for(uint i;i<len;++i){ MakerProfile storage p=makerInfo[m[i]];
+            if(!p.online) continue;
+            a[i]=p.startHourUTC<=p.endHourUTC? (h>=p.startHourUTC&&h<=p.endHourUTC)
+                : (h>=p.startHourUTC||h<=p.endHourUTC);}
     }
 
-    function getOfferKeys(
-        Side side,
-        FiatCode fiat,
-        uint256 offset,
-        uint256 limit
-    ) external view returns (address[] memory slice) {
-        address[] storage arr = _offerKeys[side][fiat];
-        uint256 len = arr.length;
-        if (offset >= len) return new address[](0);
-
-        uint256 end = offset + limit;
-        if (end > len) end = len;
-
-        slice = new address[](end - offset);
-        for (uint256 i = offset; i < end; ++i) {
-            slice[i - offset] = arr[i];
-        }
-    }
-
-
-    // 2) мои открытые сделки
-    function getOpenDealCount(address user) external view returns (uint256) {
-        return _openDeals[user].length;
-    }
-    function getOpenDeals(
-        address user,
-        uint256 offset,
-        uint256 limit
-    ) external view returns (uint96[] memory slice) {
-        uint96[] storage arr = _openDeals[user];
-        uint256 len = arr.length;
-        if (offset >= len) return new uint96[](0);
-        uint256 end = offset + limit;
-        if (end > len) end = len;
-        slice = new uint96[](end - offset);
-        for (uint256 i = offset; i < end; ++i) slice[i - offset] = arr[i];
-    }
-
-    // 3) пакетная доступность мейкеров
-    function areMakersAvailable(address[] calldata makers)
-    external
-    view
-    returns (bool[] memory avail)
-    {
-        uint256 len = makers.length;
-        avail = new bool[](len);
-
-        uint8 hour = uint8((block.timestamp / 1 hours) % 24);
-
-        for (uint256 i; i < len; ++i) {
-            MakerProfile storage p = makerInfo[makers[i]];
-            if (!p.online) continue;
-
-            bool ok;
-            if (p.startHourUTC <= p.endHourUTC) {
-                ok = (hour >= p.startHourUTC && hour <= p.endHourUTC);
-            } else {
-                ok = (hour >= p.startHourUTC || hour <= p.endHourUTC);
-            }
-            avail[i] = ok;
-        }
-    }
-
-    /*────────────────────────── FALLBACKS ─────────────────────────────────*/
-
-    receive() external payable {}
+    /*────────────── FALLBACK ─────────────────────*/
+    receive() external payable{}
 }
