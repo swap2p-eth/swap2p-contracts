@@ -387,24 +387,16 @@ contract Swap2p {
     }
 
     /*────────────── WITHDRAW ──────────────────────*/
-    uint256 private _entered;
-
     function withdraw() external {
-        if (_entered == 1) revert Reentrancy();
-        _entered = 1;
         uint128 amt = pending[msg.sender];
-        if (amt == 0) {
-            _entered = 0;
-            revert WithdrawZero();
-        }
+        if (amt == 0) revert WithdrawZero();
         pending[msg.sender] = 0;
-        (bool ok,) = msg.sender.call{value: amt}("");
-        _entered = 0;
+        (bool ok, ) = msg.sender.call{value: amt}("");
         if (!ok) revert WithdrawFailed();
         emit Withdraw(msg.sender, amt);
     }
 
-    /*────────────── READERS (как было) ───────────*/
+    /*────────────── READERS  ───────────*/
     function getOfferCount(Side s, FiatCode f) external view returns (uint256) {
         return _offerKeys[s][f].length;
     }
@@ -450,6 +442,5 @@ contract Swap2p {
         }
     }
 
-    /*────────────── FALLBACK ─────────────────────*/
     receive() external payable {}
 }
