@@ -1,66 +1,75 @@
-## Foundry
+Swap2p
+======
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+**Non-custodial P2P marketplace for swapping the native chain coin against fiat.  
+Dual-side escrow. No timelocks, no on-chain arbitration — incentives drive settlement.**
 
-Foundry consists of:
+---
 
--   **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
--   **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
--   **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
--   **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+## Table of Contents
+1. [Why Swap2p?](#why-swap2p)
+2. [How It Works](#how-it-works)
+3. [Key Invariants](#key-invariants)
+4. [Contract Layout](#contract-layout)
+5. [Security Model & Caveats](#security-model--caveats)
+6. [License](#license)
 
-## Documentation
+---
 
-https://book.getfoundry.sh/
+## Why Swap2p?
+* **No custody** – coins stay in the contract until both parties agree.
+* **Capital-efficient** – only `2 × amount` total collateral across both sides.
+* **Partner revenue** – up to 20 % of protocol fees flow to affiliates.
+* **Minimal bytecode** – single contract, optimized via-IR.
 
-## Usage
+> The protocol intentionally has **no timelocks and no on-chain arbitrator**.  
+> If either side stalls, they lose their collateral — simple game-theory, quick settlement.
 
-### Build
+---
 
-```shell
-$ forge build
-```
+## How It Works
+| Step | BUY flow (maker buys coin) | SELL flow (maker sells coin) |
+|------|---------------------------|------------------------------|
+| ① Maker posts offer | min / max, price | same |
+| ② Taker selects offer | pays `amount + 100 %` collateral | pays `100 %` collateral |
+| ③ Maker accepts | pays `100 %` collateral | pays `amount + 100 %` collateral |
+| ④ Fiat payer sends off-chain fiat | **maker** | **taker** |
+| ⑤ Fiat receiver marks paid | maker | taker |
+| ⑥ Fiat receiver releases escrow | **taker** | **maker** |
+| ⑦ Contract: sends coin minus fee, returns both collaterals |
 
-### Test
+---
 
-```shell
-$ forge test
-```
+## Key Invariants
+1. `ETH_out(maker) + ETH_out(taker) ≤ 3 × amount` for any deal.
+2. A party cancelling after *ACCEPTED* forfeits **only** its collateral, never the principal.
+3. Re-entrancy on `withdraw()` cannot double-spend `pending`.
 
-### Format
+---
 
-```shell
-$ forge fmt
-```
+## Contract Layout
+| File | Purpose |
+|------|---------|
+| `src/Swap2p.sol` | Core logic: offers, dual escrow, fee split |
+| `docs/` | Flow diagrams, audit notes |
 
-### Gas Snapshots
+---
 
-```shell
-$ forge snapshot
-```
+## Security Model & Caveats
+| Aspect | Design Choice |
+|--------|---------------|
+| Timelocks | **None** – deposits create urgency |
+| Arbitration | **None** – dispute ⇒ staller loses collateral |
+| Price oracle | Not required – price fixed at match time |
+| Re-entrancy | Only `withdraw()` performs external call; state cleared first |
+| Upgradability | Immutable bytecode (no proxy) |
 
-### Anvil
+If a user stalls after `ACCEPTED`, the counter-party cancels:
+* `maker_cancelDeal` for **BUY** deals (maker pays fiat).
+* `taker_cancelDeal` for **SELL** deals (taker pays fiat).  
+  The staller’s collateral is slashed.
 
-```shell
-$ anvil
-```
+---
 
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+## License
+Released under the MIT License – see [`LICENSE`](LICENSE).

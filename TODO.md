@@ -1,3 +1,5 @@
 # TODO
-- format
-- maker / taker stats (complete / canceled deals
+- tests
+- coverage 100%
+- echidna
+- static analyzers
